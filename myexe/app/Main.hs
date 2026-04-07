@@ -9,6 +9,7 @@ import Data.Text (Text)
 import Foreign.C.String (CString, peekCString)
 import Foreign.Ptr (FunPtr, castPtrToFunPtr, nullPtr)
 import Foreign.StablePtr (StablePtr, freeStablePtr, newStablePtr)
+import GitRev (gitRev)
 import Runtime.Linker (initLinker, loadArchive, loadObj, lookupSymbol, resolveObjs)
 import System.Environment (getArgs)
 import System.Exit (exitFailure)
@@ -48,11 +49,14 @@ main = do
     else do
       let processMapFn = mkProcessMap $ castPtrToFunPtr ptr
 
+      putStrLn $ "Git revision: " ++ show gitRev
+
       let theMap :: Map Text Text
           theMap = Map.fromList
             [ ("name", "static-dylib")
             , ("version", "0.1.0.0")
             , ("status", "dynamically loaded")
+            , ("git-rev", gitRev)
             ]
 
       sptr <- newStablePtr theMap

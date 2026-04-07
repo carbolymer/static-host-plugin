@@ -5,8 +5,11 @@ build-type:    Simple
 
 executable myexe
   main-is:       Main.hs
-  other-modules: Runtime.Linker
+  other-modules:
+    GitRev
+    Runtime.Linker
   hs-source-dirs: app
+  c-sources:     cbits/rev.c
   build-depends:
     base >= 4.14 && < 5,
     containers,

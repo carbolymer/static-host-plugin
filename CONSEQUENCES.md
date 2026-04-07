@@ -124,6 +124,26 @@ The loaded `.o` files must be compiled with the **exact same GHC version** and t
 A mismatch in package versions (e.g. `text-2.1.2` vs `text-2.1.1`) means different symbol names (the unit-id is part of the Z-encoded symbol), leading to unresolved symbols.
 A mismatch in GHC versions means different RTS calling conventions, leading to crashes.
 
+### Duplicated dependencies
+
+If `myexe` statically links one version of a library (e.g. `text-2.1.2`) and `mylib`'s loaded archives contain a different version (e.g. `text-2.0.1`), both coexist in the process.
+GHC Z-encodes the unit-id (including version) into every symbol name, so the two copies have distinct symbol names and the RTS linker resolves them independently -- no link-time error occurs.
+
+The problem arises at the data boundary.
+When `myexe` creates a value (e.g. `Text`) using its statically linked `text-2.1.2` and passes it via `StablePtr` to `mylib`, the loaded code hands that value to `text-2.0.1` functions.
+If the internal memory representation differs between versions, those functions misinterpret the data -- undefined behaviour, typically a segfault or silent corruption.
+The GC sees no issue because both versions allocate on the same heap; the corruption happens at the code level, not the heap level.
+
+| Situation | Symbol resolution | Data sharing across boundary |
+|-----------|------------------|------------------------------|
+| Same version, same unit-id | works | safe |
+| Same version, different build flags (different unit-id) | unresolved symbols | N/A |
+| Different minor version (compatible representation) | works (two copies loaded) | undefined behaviour -- may work by accident |
+| Different major version (incompatible representation) | works (two copies loaded) | crash or corruption |
+
+The RTS linker provides no protection against this.
+Both sides must be built from the same cabal plan to guarantee ABI compatibility.
+
 ### No isolation
 
 A bug in loaded code (infinite loop, memory leak, segfault) affects the entire process.
@@ -149,6 +169,8 @@ The `rts` archive must **not** be loaded (it conflicts with the already-running 
   Apple Silicon enforces W^X (write-or-execute, never both) at the hardware level.
   The RTS linker must use `pthread_jit_write_protect_np` to toggle between writable and executable pages.
   Hardened runtime entitlements (`com.apple.security.cs.allow-jit`) may be required.
+  **Known issue**: GHC 9.12.2 has an assertion failure (`ASSERT(symhash != NULL)` in `lookupDependentSymbol`, `rts/Linker.c:866`) when loading many archives on this platform.
+  This is a GHC bug -- upgrading to a patched GHC release may be required.
 - **x86_64-windows** (cross-compiled via mingwW64): The RTS linker handles PE/COFF.
   Works but the low-2GB address space constraint is tighter on Windows.
   The `+RTS -xp` flag can relax this if code is compiled with `-fPIC -fexternal-dynamic-refs`.

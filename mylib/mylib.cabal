@@ -10,6 +10,9 @@ library
   hs-source-dirs:  src
   build-depends:
     base >= 4.14 && < 5,
+    proto-lens >= 0.7.1.6,
+    proto-lens-protobuf-types,
+    proto-lens-runtime,
     rio,
 
   default-extensions:
