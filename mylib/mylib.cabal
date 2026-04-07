@@ -4,7 +4,15 @@ version:       0.1.0.0
 build-type:    Simple
 
 library
-  exposed-modules: MyLib
+  exposed-modules:
+    MyLib
+
   hs-source-dirs:  src
-  build-depends:   base >= 4.14 && < 5
+  build-depends:
+    base >= 4.14 && < 5,
+    rio,
+
+  default-extensions:
+    OverloadedStrings
+
   default-language: Haskell2010

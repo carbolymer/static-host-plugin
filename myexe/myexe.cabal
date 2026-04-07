@@ -5,8 +5,11 @@ build-type:    Simple
 
 executable myexe
   main-is:       Main.hs
+  other-modules: Runtime.Linker
   hs-source-dirs: app
   build-depends:
     base >= 4.14 && < 5,
-    mylib
+    containers,
+    text,
+
   default-language: Haskell2010
