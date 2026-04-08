@@ -1,3 +1,4 @@
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE ForeignFunctionInterface #-}
 {-# LANGUAGE OverloadedStrings #-}
 
@@ -41,7 +42,11 @@ main = do
       putStrLn "ERROR: Failed to resolve symbols."
       exitFailure
 
+#if defined(darwin_HOST_OS)
+  ptr <- lookupSymbol "_hs_process_map"
+#else
   ptr <- lookupSymbol "hs_process_map"
+#endif
   if ptr == nullPtr
     then do
       putStrLn "ERROR: Symbol 'hs_process_map' not found."

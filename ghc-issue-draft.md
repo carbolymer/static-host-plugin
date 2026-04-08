@@ -1,14 +1,18 @@
-# RTS linker `CHECK(lbl[0] == '_')` assertion in `lookupDependentSymbol` on aarch64-darwin
+# RTS linker `CHECK(lbl[0] == '_')` assertion in `lookupDependentSymbol` on darwin
 
 ## Summary
 
-The RTS linker crashes with `ASSERTION FAILED` in [`lookupDependentSymbol`](https://gitlab.haskell.org/ghc/ghc/-/blob/master/rts/Linker.c#L805) (`rts/Linker.c`) on aarch64-darwin when loading `.a` archives via the C API (`loadArchive`/`resolveObjs`/`lookupSymbol`).
-Reproducible on GHC 9.6.7 and 9.12.2.
-The same code works on x86_64-linux, aarch64-linux, and x86_64-darwin.
+The RTS linker's public C API [`lookupSymbol`](https://gitlab.haskell.org/ghc/ghc/-/blob/master/rts/Linker.c#L976) crashes with `ASSERTION FAILED` on macOS (darwin) when the caller passes a symbol name without the Mach-O leading underscore prefix.
+
+The Haskell wrapper `GHCi.ObjLink.lookupSymbol` correctly adds the prefix via `prefixUnderscore` before calling the C API, so GHCi/TH users are not affected.
+However, direct C/FFI callers of the RTS `lookupSymbol` function have no way to know this requirement -- the API does not document it, and the Haskell-level prefix logic is not accessible from C.
+When the lookup fails in `symhash` (because the name lacks `_`), the Mach-O fallback path hits [`CHECK(lbl[0] == '_')` at rts/Linker.c:872](https://gitlab.haskell.org/ghc/ghc/-/blob/master/rts/Linker.c#L872) and aborts the process.
+
+This affects **all darwin platforms** (both x86_64-darwin and aarch64-darwin).
 
 ## Error output
 
-GHC 9.6.7:
+GHC 9.6.7 on aarch64-darwin:
 
 ```
 myexe: internal error: ASSERTION FAILED: file rts/Linker.c, line 952
@@ -17,7 +21,7 @@ myexe: internal error: ASSERTION FAILED: file rts/Linker.c, line 952
     Please report this as a GHC bug:  https://www.haskell.org/ghc/reportabug
 ```
 
-GHC 9.12.2:
+GHC 9.12.2 on aarch64-darwin:
 
 ```
 myexe: internal error: ASSERTION FAILED: file rts/Linker.c, line 866
@@ -25,6 +29,8 @@ myexe: internal error: ASSERTION FAILED: file rts/Linker.c, line 866
     (GHC version 9.12.2 for aarch64_apple_darwin)
     Please report this as a GHC bug:  https://www.haskell.org/ghc/reportabug
 ```
+
+Both correspond to `CHECK(lbl[0] == '_')` in [`lookupDependentSymbol`](https://gitlab.haskell.org/ghc/ghc/-/blob/master/rts/Linker.c#L805) (verified: [line 952 in 9.6.7](https://gitlab.haskell.org/ghc/ghc/-/blob/ghc-9.6.7-release/rts/Linker.c#L952), [line 866 in 9.12.2](https://gitlab.haskell.org/ghc/ghc/-/blob/ghc-9.12.2-release/rts/Linker.c#L866), [line 872 on master](https://gitlab.haskell.org/ghc/ghc/-/blob/master/rts/Linker.c#L872)).
 
 ## Steps to reproduce
 
@@ -34,19 +40,20 @@ https://github.com/carbolymer/static-host-plugin/
 
 ### Quick reproduction (nix)
 
-On an aarch64-darwin machine:
+On an aarch64-darwin or x86_64-darwin machine:
 
 ```bash
-nix build path:.#checks.aarch64-darwin.dynamic-load
+nix build path:.#checks.aarch64-darwin.dynamic-load   # on Apple Silicon
+nix build path:.#checks.x86_64-darwin.dynamic-load     # on Intel Mac
 ```
 
 ### What the reproduction does
 
 Two cabal packages: `myexe` (executable) and `mylib` (library with `foreign export ccall`).
-`myexe` uses the RTS linker C API directly via FFI to load `mylib`'s `.a` archives at runtime:
+`myexe` uses the RTS linker C API directly via FFI:
 
 ```haskell
--- Runtime/Linker.hs -- direct FFI to RTS C API
+-- Runtime/Linker.hs -- direct FFI bindings to RTS C API
 foreign import ccall "initLinker_" rts_initLinker :: IO ()
 foreign import ccall "loadArchive" rts_loadArchive :: CString -> IO Int
 foreign import ccall "resolveObjs" rts_resolveObjs :: IO Int
@@ -54,198 +61,102 @@ foreign import ccall "lookupSymbol" rts_lookupSymbol :: CString -> IO (Ptr ())
 ```
 
 ```haskell
--- Main.hs -- loads ~60 archives then looks up a symbol
+-- Main.hs
 main = do
   initLinker
-  mapM_ loadArchive archives   -- base, ghc-internal, text, containers, rio, mylib, ...
-  resolveObjs                  -- crash may occur here (cascading resolution)
-  lookupSymbol "hs_process_map"  -- or here
+  mapM_ loadArchive archives     -- ~60 Haskell .a archives (boot libs + deps)
+  resolveObjs                    -- succeeds (archive members are OBJECT_LOADED, not OBJECT_NEEDED)
+  lookupSymbol "hs_process_map"  -- CRASH: name lacks leading underscore on darwin
 ```
 
 ```haskell
--- MyLib.hs -- the dynamically loaded function
+-- MyLib.hs -- the dynamically loaded library
 foreign export ccall "hs_process_map"
   hs_process_map :: StablePtr (Map Text Text) -> IO CString
 ```
 
+The same code works on x86_64-linux and aarch64-linux (ELF has no underscore prefix convention).
+
 ## Root cause analysis
 
-The assertion is in [`lookupDependentSymbol` at rts/Linker.c:872](https://gitlab.haskell.org/ghc/ghc/-/blob/master/rts/Linker.c#L872) (GHC master):
+### How symbol names work on Mach-O
 
-```c
-#elif defined(OBJFORMAT_MACHO)
-    /* HACK: On OS X, all symbols are prefixed with an underscore.
-             However, dlsym wants us to omit the leading underscore from the
-             symbol name -- the dlsym routine puts it back on before
-             searching for the symbol. For now, we simply strip it off here
-             (and ONLY here).
-    */
-    CHECK(lbl[0] == '_');           // line 872
-    return internal_dlsym(lbl + 1); // line 878
-```
+On darwin (Mach-O), all external C symbols have a leading underscore in the object file.
+`foreign export ccall "hs_process_map"` generates a C symbol which Mach-O stores as `_hs_process_map` in the nlist table.
 
-When a symbol is not found in `symhash`, the Mach-O fallback path assumes the label starts with `_` and strips it before calling `dlsym`.
-`CHECK` fires in all builds (not just debug), so this is a hard crash with no workaround.
+When [`ocGetNames_MachO`](https://gitlab.haskell.org/ghc/ghc/-/blob/master/rts/linker/MachO.c) loads an archive member, it inserts the nlist name (with underscore) into `symhash`.
+So `symhash` contains `_hs_process_map`, not `hs_process_map`.
 
-There are two code paths that can reach this `CHECK` with a non-underscore label:
+### The crash path
 
-### Path 1: Missing `r_extern` check in aarch64 Mach-O relocation handling
+1. User calls [`lookupSymbol("hs_process_map")`](https://gitlab.haskell.org/ghc/ghc/-/blob/master/rts/Linker.c#L976) via FFI (no underscore).
+2. [`lookupDependentSymbol`](https://gitlab.haskell.org/ghc/ghc/-/blob/master/rts/Linker.c#L805) checks [`symhash`](https://gitlab.haskell.org/ghc/ghc/-/blob/master/rts/Linker.c#L837) for `"hs_process_map"` -- **not found** (stored as `"_hs_process_map"`).
+3. Falls through to the [`OBJFORMAT_MACHO` dlsym fallback](https://gitlab.haskell.org/ghc/ghc/-/blob/master/rts/Linker.c#L862):
+   ```c
+   /* HACK: On OS X, all symbols are prefixed with an underscore.
+            However, dlsym wants us to omit the leading underscore from the
+            symbol name -- the dlsym routine puts it back on before
+            searching for the symbol. For now, we simply strip it off here
+            (and ONLY here).
+   */
+   CHECK(lbl[0] == '_');           // line 872 -- 'h' != '_', CRASH
+   return internal_dlsym(lbl + 1); // line 878 -- never reached
+   ```
+4. `CHECK('h' == '_')` fails, process aborts via `barf()`.
 
-This is the likely trigger when loading many archives (crash during cascading `resolveObjs`).
+### Why it works on Linux
 
-In `rts/linker/MachO.c`, the x86_64 relocation handler [`relocateSection`](https://gitlab.haskell.org/ghc/ghc/-/blob/master/rts/linker/MachO.c#L737) has a clean three-way dispatch on `r_extern`:
+On ELF (Linux, including musl), there is no leading underscore convention.
+`symhash` stores `hs_process_map` directly, and `lookupSymbol("hs_process_map")` finds it immediately.
+The `OBJFORMAT_ELF` fallback path ([line 841](https://gitlab.haskell.org/ghc/ghc/-/blob/master/rts/Linker.c#L841)) calls `internal_dlsym(lbl)` without any underscore assertion, so even cache misses are safe.
 
-```c
-// x86_64 path -- three-way dispatch in relocateSection (rts/linker/MachO.c)
+### Why resolveObjs is not involved
 
-// 1. GOT relocations (line 835)
-if (type == X86_64_RELOC_GOT        // https://gitlab.haskell.org/ghc/ghc/-/blob/master/rts/linker/MachO.c#L835
- || type == X86_64_RELOC_GOT_LOAD)
-{
-    if (reloc->r_extern == 0) {      // https://gitlab.haskell.org/ghc/ghc/-/blob/master/rts/linker/MachO.c#L845
-        errorBelch("...");           // explicit r_extern == 0 check
-    }
-    // ...
-}
-// 2. External relocations (line 900)
-else if (reloc->r_extern) {         // https://gitlab.haskell.org/ghc/ghc/-/blob/master/rts/linker/MachO.c#L900
-    MachOSymbol *symbol = &symbols[reloc->r_symbolnum];  // symbol index -- correct
-    // ...
-}
-// 3. Internal relocations (line 934)
-else {                               // https://gitlab.haskell.org/ghc/ghc/-/blob/master/rts/linker/MachO.c#L934
-    // r_extern == 0: r_symbolnum is a 1-based SECTION ORDINAL
-    int targetSecNum = reloc->r_symbolnum - 1;  // line 951
-    Section *targetSec = &oc->sections[targetSecNum];
-    // computes relocated address from section base, no symbol lookup
-}
-```
+[`loadArchive`](https://gitlab.haskell.org/ghc/ghc/-/blob/master/rts/Linker.c) loads object files as `OBJECT_LOADED` and registers their symbols in `symhash`.
+[`resolveObjs`](https://gitlab.haskell.org/ghc/ghc/-/blob/master/rts/Linker.c#L1724) iterates objects and calls [`ocTryLoad`](https://gitlab.haskell.org/ghc/ghc/-/blob/master/rts/Linker.c#L1606), which [immediately returns 1 when `status != OBJECT_NEEDED`](https://gitlab.haskell.org/ghc/ghc/-/blob/master/rts/Linker.c#L1609).
+Since archive members are `OBJECT_LOADED` (not `OBJECT_NEEDED`), `resolveObjs` is effectively a no-op -- no relocations are processed, no symbols are looked up.
+The crash occurs later, at the explicit `lookupSymbol` call.
 
-The aarch64 relocation handler [`relocateSectionAarch64`](https://gitlab.haskell.org/ghc/ghc/-/blob/master/rts/linker/MachO.c#L584) (lines 584-732) **never checks `ri->r_extern`** for any relocation type.
-Every handler blindly uses `ri->r_symbolnum` as a symbol array index:
+### The Haskell wrapper handles this correctly
 
-```c
-// aarch64 path (buggy) -- no r_extern check anywhere
-
-case ARM64_RELOC_UNSIGNED: {        // https://gitlab.haskell.org/ghc/ghc/-/blob/master/rts/linker/MachO.c#L607
-    MachOSymbol* symbol = &oc->info->macho_symbols[ri->r_symbolnum];  // line 608
-    uint64_t value = symbol_value(oc, symbol);  // calls lookupDependentSymbol if N_EXT
-    // ...
-}
-case ARM64_RELOC_SUBTRACTOR:        // https://gitlab.haskell.org/ghc/ghc/-/blob/master/rts/linker/MachO.c#L614
-{
-    MachOSymbol* symbol1 = &oc->info->macho_symbols[ri->r_symbolnum];  // line 635
-    // ...
-    MachOSymbol* symbol2 = &oc->info->macho_symbols[ri2->r_symbolnum]; // line 640
-    // ...
-}
-case ARM64_RELOC_BRANCH26: {        // https://gitlab.haskell.org/ghc/ghc/-/blob/master/rts/linker/MachO.c#L651
-    MachOSymbol* symbol = &oc->info->macho_symbols[ri->r_symbolnum];   // line 652
-    if(symbol->nlist->n_type & N_EXT)
-        value = (uint64_t)lookupDependentSymbol((char*)symbol->name, oc, NULL);
-    // ...
-}
-case ARM64_RELOC_PAGE21:            // https://gitlab.haskell.org/ghc/ghc/-/blob/master/rts/linker/MachO.c#L689
-case ARM64_RELOC_GOT_LOAD_PAGE21: {
-    MachOSymbol* symbol = &oc->info->macho_symbols[ri->r_symbolnum];   // line 691
-    // ...
-}
-case ARM64_RELOC_PAGEOFF12:         // https://gitlab.haskell.org/ghc/ghc/-/blob/master/rts/linker/MachO.c#L704
-case ARM64_RELOC_GOT_LOAD_PAGEOFF12: {
-    MachOSymbol* symbol = &oc->info->macho_symbols[ri->r_symbolnum];   // line 706
-    // ...
-}
-```
-
-When `r_extern == 0`, `r_symbolnum` is a **section ordinal** (1-based), not a symbol index.
-Indexing `macho_symbols[section_ordinal]` reads a completely wrong symbol entry.
-That wrong symbol's `name` may lack the leading `_` (e.g. a local symbol, debug symbol, or just a coincidentally-indexed entry), causing the `CHECK` to fire when [`lookupDependentSymbol`](https://gitlab.haskell.org/ghc/ghc/-/blob/master/rts/Linker.c#L872) falls through to `dlsym`.
-
-There is also a **second latent bug** in [`findInternalGotRefs` at line 487](https://gitlab.haskell.org/ghc/ghc/-/blob/master/rts/linker/MachO.c#L487), which also never checks `r_extern`:
-
-```c
-// https://gitlab.haskell.org/ghc/ghc/-/blob/master/rts/linker/MachO.c#L497-L500
-if (isGotLoad(ri)) {
-    MachOSymbol* symbol = &oc->info->macho_symbols[ri->r_symbolnum];  // line 498 -- no r_extern check
-    symbol->needs_got = true;
-}
-```
-
-If a GOT relocation has `r_extern == 0`, this corrupts the wrong symbol's `needs_got` flag.
-
-Summary of affected vs safe code paths:
-
-| Code path | Checks `r_extern`? | Safe for `r_extern == 0`? |
-|---|---|---|
-| x86_64 [`relocateSection` GOT (L835)](https://gitlab.haskell.org/ghc/ghc/-/blob/master/rts/linker/MachO.c#L835) | [Yes (L845)](https://gitlab.haskell.org/ghc/ghc/-/blob/master/rts/linker/MachO.c#L845) | Yes (prints error) |
-| x86_64 [`relocateSection` extern (L900)](https://gitlab.haskell.org/ghc/ghc/-/blob/master/rts/linker/MachO.c#L900) | Yes | N/A |
-| x86_64 [`relocateSection` internal (L934)](https://gitlab.haskell.org/ghc/ghc/-/blob/master/rts/linker/MachO.c#L934) | Yes (implicit else) | [Yes (section ordinal, L951)](https://gitlab.haskell.org/ghc/ghc/-/blob/master/rts/linker/MachO.c#L951) |
-| **aarch64 [`relocateSectionAarch64` (L584)](https://gitlab.haskell.org/ghc/ghc/-/blob/master/rts/linker/MachO.c#L584) all types** | **No** | **No -- BUG** |
-| **aarch64 [`findInternalGotRefs` (L498)](https://gitlab.haskell.org/ghc/ghc/-/blob/master/rts/linker/MachO.c#L498)** | **No** | **No -- latent BUG** |
-| [`resolveImports`](https://gitlab.haskell.org/ghc/ghc/-/blob/master/rts/linker/MachO.c#L221) | N/A (indirect sym table) | N/A |
-| `ocResolve_MachO` GOT fill | N/A (iterates symbols) | N/A |
-
-This explains why the bug is **aarch64-specific**: the x86_64 Mach-O path handles `r_extern == 0` correctly by design.
-Loading many archives increases the probability of encountering an object file with `r_extern == 0` relocations (common in C code and optimised Haskell output), which triggers the misinterpretation.
-
-### Path 2: Public C API does not add underscore prefix
-
-The public C API [`lookupSymbol`](https://gitlab.haskell.org/ghc/ghc/-/blob/master/rts/Linker.c#L976) in `rts/Linker.c` (line 976) passes the label directly to `lookupDependentSymbol` without adding the platform's leading underscore.
-
-The Haskell wrapper `GHCi.ObjLink.lookupSymbol` correctly uses `prefixUnderscore` before calling the C API.
-But direct C/FFI callers (like this reproduction case) pass `"hs_process_map"` without underscore.
-
-On Mach-O, `symhash` stores `_hs_process_map` (from the nlist table).
-The lookup for `"hs_process_map"` fails, falls through to `dlsym`, and `CHECK('h' == '_')` fires.
-
-This path may or may not be the trigger in this specific case (the crash could happen earlier during cascading resolution via Path 1), but it is a separate bug in the API: `lookupSymbol` should either document the underscore requirement or handle it internally.
+`GHCi.ObjLink.lookupSymbol` uses `prefixUnderscore` (which checks `cLeadingUnderscore` from the GHC settings) to prepend `_` before calling the C API.
+Direct C/FFI callers have no access to this logic and no documentation telling them to add the prefix.
 
 ## Platform
 
-- **Architecture**: aarch64 (Apple Silicon, M-series)
-- **OS**: macOS (darwin)
-- **GHC versions tested**: 9.6.7, 9.12.2
-
-Works on x86_64-linux, aarch64-linux, and x86_64-darwin.
+- **OS**: macOS (darwin) -- both x86_64 and aarch64
+- **GHC versions tested**: 9.6.7, 9.12.2 (the CHECK exists on master too)
+- **Not affected**: Linux (x86_64-linux, aarch64-linux, musl64) -- ELF has no underscore convention
 
 ## Expected behaviour
 
-`resolveObjs` and `lookupSymbol` should either succeed or return a meaningful error (NULL / unresolved symbol name), not crash via `barf()`.
+The public C API `lookupSymbol` should handle the platform's symbol prefix convention transparently, matching the behaviour of the Haskell wrapper.
+Alternatively, the `CHECK` should be replaced with a graceful error (return NULL) instead of aborting the process.
 
 ## Suggested fixes
 
-### For Path 1 (primary fix): Add `r_extern` handling to aarch64 Mach-O relocations
+### Option A: Add prefix in the `lookupSymbol` C API
 
-In [`rts/linker/MachO.c`](https://gitlab.haskell.org/ghc/ghc/-/blob/master/rts/linker/MachO.c), [`relocateSectionAarch64`](https://gitlab.haskell.org/ghc/ghc/-/blob/master/rts/linker/MachO.c#L584) should check `ri->r_extern` before using `ri->r_symbolnum` as a symbol index, mirroring the x86_64 three-way dispatch in [`relocateSection` (lines 835-1012)](https://gitlab.haskell.org/ghc/ghc/-/blob/master/rts/linker/MachO.c#L835).
-Each relocation type handler needs an `r_extern` guard:
-
-```c
-case ARM64_RELOC_UNSIGNED: {
-    if (ri->r_extern) {
-        MachOSymbol* symbol = &oc->info->macho_symbols[ri->r_symbolnum];
-        uint64_t value = symbol_value(oc, symbol);
-        // ... existing logic
-    } else {
-        // r_symbolnum is a 1-based section ordinal
-        int targetSecNum = ri->r_symbolnum - 1;
-        Section *targetSec = &oc->sections[targetSecNum];
-        // compute relocated address from section base
-    }
-    break;
-}
-// Same pattern for ARM64_RELOC_BRANCH26, ARM64_RELOC_PAGE21, etc.
-```
-
-Similarly, [`findInternalGotRefs` (line 497)](https://gitlab.haskell.org/ghc/ghc/-/blob/master/rts/linker/MachO.c#L497) should guard the `r_extern` check:
+Make [`lookupSymbol`](https://gitlab.haskell.org/ghc/ghc/-/blob/master/rts/Linker.c#L976) add the platform prefix before calling `lookupDependentSymbol`, matching the Haskell wrapper:
 
 ```c
-if (isGotLoad(ri) && ri->r_extern) {
-    MachOSymbol* symbol = &oc->info->macho_symbols[ri->r_symbolnum];
-    symbol->needs_got = true;
-}
+SymbolAddr* lookupSymbol( SymbolName* lbl )
+{
+    ACQUIRE_LOCK(&linker_mutex);
+#if defined(LEADING_UNDERSCORE)
+    size_t len = strlen(lbl);
+    char *prefixed = stgMallocBytes(len + 2, "lookupSymbol");
+    prefixed[0] = '_';
+    memcpy(prefixed + 1, lbl, len + 1);
+    SymbolAddr* r = lookupDependentSymbol(prefixed, NULL, NULL);
+    stgFree(prefixed);
+#else
+    SymbolAddr* r = lookupDependentSymbol(lbl, NULL, NULL);
+#endif
+    // ... rest unchanged
 ```
 
-### For Path 2: Harden the `dlsym` fallback in `lookupDependentSymbol`
+### Option B: Harden the dlsym fallback
 
 Replace the unconditional [`CHECK` at line 872](https://gitlab.haskell.org/ghc/ghc/-/blob/master/rts/Linker.c#L872) with a graceful fallback:
 
@@ -259,15 +170,4 @@ Replace the unconditional [`CHECK` at line 872](https://gitlab.haskell.org/ghc/g
     return internal_dlsym(lbl + 1);
 ```
 
-### For Path 2 (alternative): Add prefix in `lookupSymbol` C API
-
-Make the public C API [`lookupSymbol`](https://gitlab.haskell.org/ghc/ghc/-/blob/master/rts/Linker.c#L976) match the Haskell wrapper's behaviour:
-
-```c
-void* lookupSymbol(const char* lbl) {
-#if defined(LEADING_UNDERSCORE)
-    // ... prepend '_' to lbl before lookup
-#endif
-    return lookupSymbol_(lbl);
-}
-```
+Option A is preferred because it makes the C API consistent with the Haskell wrapper, rather than silently returning NULL for valid symbol names.
