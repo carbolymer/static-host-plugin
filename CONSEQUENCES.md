@@ -169,8 +169,10 @@ The `rts` archive must **not** be loaded (it conflicts with the already-running 
   Apple Silicon enforces W^X (write-or-execute, never both) at the hardware level.
   The RTS linker must use `pthread_jit_write_protect_np` to toggle between writable and executable pages.
   Hardened runtime entitlements (`com.apple.security.cs.allow-jit`) may be required.
-  **Known issue**: GHC 9.12.2 has an assertion failure (`ASSERT(symhash != NULL)` in `lookupDependentSymbol`, `rts/Linker.c:866`) when loading many archives on this platform.
-  This is a GHC bug -- upgrading to a patched GHC release may be required.
+  **Known issue**: The RTS linker has an assertion failure when loading many archives on this platform.
+  Observed on GHC 9.6.7 (`rts/Linker.c:952`) and GHC 9.12.2 (`rts/Linker.c:866`, `lookupDependentSymbol`).
+  This appears to be a long-standing GHC bug on aarch64-darwin, not specific to any single GHC version.
+  The dynamic-load check is expected to fail on this platform until a GHC fix lands.
 - **x86_64-windows** (cross-compiled via mingwW64): The RTS linker handles PE/COFF.
   Works but the low-2GB address space constraint is tighter on Windows.
   The `+RTS -xp` flag can relax this if code is compiled with `-fPIC -fexternal-dynamic-refs`.
